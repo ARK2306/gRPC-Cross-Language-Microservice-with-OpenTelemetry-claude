@@ -1,0 +1,26 @@
+# dependencies
+node_modules/
+.pnpm-store/
+
+# build output
+dist/
+*.tsbuildinfo
+
+# generated protobuf stubs (recreated by `pnpm build`)
+shared/node/
+shared/python/
+
+# python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# env / local overrides
+.env
+.env.local
+docker-compose.override.yml
+
+# logs & scratch
+*.log
+.DS_Store

@@ -1,0 +1,30 @@
+{
+  "name": "grpc-prediction-service",
+  "version": "1.0.0",
+  "private": true,
+  "description": "gRPC prediction service: Fastify REST gateway + Python inference sidecar, traced end-to-end with OpenTelemetry.",
+  "packageManager": "pnpm@9.15.4",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "pnpm run proto && pnpm run build:api",
+    "proto": "pnpm run proto:node && pnpm run proto:python",
+    "proto:node": "node scripts/gen-node.mjs",
+    "proto:python": "node scripts/gen-python.mjs",
+    "build:api": "pnpm --filter @grpc-prediction/api run build",
+    "clean": "node scripts/clean.mjs",
+    "lint": "pnpm --filter @grpc-prediction/api run typecheck",
+    "test": "pnpm --filter @grpc-prediction/tests run test",
+    "test:unit": "pnpm --filter @grpc-prediction/tests run test:unit",
+    "dev:api": "pnpm --filter @grpc-prediction/api run dev",
+    "up": "docker compose up -d --build",
+    "down": "docker compose down -v",
+    "logs": "docker compose logs -f"
+  },
+  "devDependencies": {
+    "@grpc/grpc-js": "^1.12.4",
+    "@grpc/proto-loader": "^0.7.13",
+    "typescript": "^5.7.2"
+  }
+}

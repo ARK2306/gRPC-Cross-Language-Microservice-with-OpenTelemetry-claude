@@ -1,0 +1,16 @@
+{
+  "name": "@grpc-prediction/tests",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test --test-reporter=spec --test-concurrency=1 \"src/*.test.mjs\"",
+    "test:predict": "node --test --test-reporter=spec src/predict.test.mjs",
+    "test:stream": "node --test --test-reporter=spec src/stream.test.mjs",
+    "test:tracing": "node --test --test-reporter=spec src/tracing.test.mjs"
+  },
+  "dependencies": {
+    "@grpc/grpc-js": "^1.12.4",
+    "@grpc/proto-loader": "^0.7.13"
+  }
+}

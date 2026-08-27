@@ -1,0 +1,43 @@
+# Runtime dependencies for the Python inference sidecar.
+#
+# Fully pinned, including transitives, so the container image and CI resolve
+# byte-identical dependency trees. Regenerate with:
+#   docker run --rm python:3.12-slim sh -c 'pip install -q <top-level deps> && pip freeze'
+#
+# grpcio here MUST stay in step with the grpcio-tools version that generates
+# /shared/python (see GRPCIO_TOOLS_VERSION in scripts/gen-python.mjs): the
+# generated *_pb2.py assert a minimum protobuf runtime version at import time.
+
+# --- gRPC server ---
+grpcio==1.83.0
+grpcio-health-checking==1.83.0
+grpcio-reflection==1.83.0
+protobuf==7.36.0
+
+# --- mock model ---
+numpy==2.5.2
+
+# --- cache ---
+redis==8.1.0
+
+# --- OpenTelemetry: OTLP/HTTP export to the Jaeger collector ---
+opentelemetry-api==1.44.0
+opentelemetry-sdk==1.44.0
+opentelemetry-exporter-otlp-proto-common==1.44.0
+opentelemetry-exporter-otlp-proto-http==1.44.0
+opentelemetry-instrumentation==0.65b0
+opentelemetry-instrumentation-grpc==0.65b0
+opentelemetry-instrumentation-redis==0.65b0
+opentelemetry-proto==1.44.0
+opentelemetry-semantic-conventions==0.65b0
+
+# --- transitive pins ---
+certifi==2026.7.22
+charset-normalizer==3.5.1
+googleapis-common-protos==1.75.2
+idna==3.19
+packaging==26.3
+requests==2.34.2
+typing_extensions==4.16.0
+urllib3==2.7.0
+wrapt==2.3.0

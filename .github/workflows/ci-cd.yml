@@ -1,0 +1,381 @@
+# CI/CD for the gRPC prediction service.
+#
+#   build   - installs protoc/pnpm/Python/Node, runs `pnpm build`, typechecks
+#   test    - spins Redis + Jaeger up with `docker run`, starts both services,
+#             and runs the integration suite (gRPC streaming + trace export)
+#   images  - builds both containers and enforces the 300 MB size budget
+#   publish - on push to main, logs in to GHCR with $GHCR_TOKEN and pushes
+#
+# `publish` needs both `test` and `images` to be green, so a broken build can
+# never be promoted to a published tag.
+
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "22.12.0"
+  PYTHON_VERSION: "3.12"
+  PNPM_VERSION: "9.15.4"
+  REGISTRY: ghcr.io
+  API_IMAGE: ghcr.io/${{ github.repository_owner }}/grpc-prediction-api
+  SIDECAR_IMAGE: ghcr.io/${{ github.repository_owner }}/grpc-prediction-sidecar
+  MAX_IMAGE_MB: "300"
+
+jobs:
+  # ---------------------------------------------------------------- build
+  build:
+    name: Build (protoc + pnpm + tsc)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # A system protoc is not strictly required — codegen uses the protoc
+      # bundled with grpcio-tools and @grpc/proto-loader — but installing it
+      # lets the workflow assert the .proto is valid on its own terms.
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "28.3"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Lint the proto definition
+        run: |
+          protoc --version
+          protoc --proto_path=proto --descriptor_set_out=/dev/null proto/prediction.proto
+          echo "proto/prediction.proto compiles cleanly"
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: sidecar/requirements-dev.txt
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r sidecar/requirements-dev.txt
+
+      # Single command, as required: compiles both sets of stubs and builds the
+      # gateway. GRPCIO_TOOLS_VERSION is unset because grpcio-tools is already
+      # on PATH from requirements-dev.txt, so no throwaway venv is provisioned.
+      - name: pnpm build
+        run: pnpm build
+
+      - name: Verify generated stubs
+        run: |
+          test -f shared/node/prediction.proto
+          test -d shared/node/types
+          test -f shared/python/prediction_pb2.py
+          test -f shared/python/prediction_pb2_grpc.py
+          PYTHONPATH=shared/python python -c "import prediction_pb2_grpc; print('python stubs OK')"
+          test -f api/dist/server.js
+          echo "build output verified"
+
+      - name: Typecheck
+        run: pnpm lint
+
+      - name: Sidecar unit tests
+        working-directory: sidecar
+        run: python -m pytest tests -q
+
+      - name: Upload build output
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-output
+          path: |
+            shared/
+            api/dist/
+          retention-days: 3
+
+  # ----------------------------------------------------------------- test
+  test:
+    name: Integration tests (gRPC streaming + trace export)
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: sidecar/requirements-dev.txt
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r sidecar/requirements-dev.txt
+
+      - run: pnpm build
+
+      # Started with `docker run` rather than as job services so the OTLP and
+      # admin ports can be published exactly as docker-compose.yml does.
+      - name: Start Redis and Jaeger
+        run: |
+          docker run -d --name redis -p 6379:6379 \
+            --health-cmd 'redis-cli ping' --health-interval 5s --health-retries 20 \
+            redis:7-alpine
+
+          docker run -d --name jaeger \
+            -e COLLECTOR_OTLP_ENABLED=true \
+            -p 16686:16686 -p 4318:4318 -p 4317:4317 -p 14250:14250 -p 14269:14269 \
+            --health-cmd 'wget --quiet --tries=1 --spider http://localhost:14269/' \
+            --health-interval 5s --health-retries 20 \
+            jaegertracing/all-in-one:1.62.0
+
+      - name: Wait for Redis and Jaeger to report healthy
+        run: |
+          for container in redis jaeger; do
+            echo "waiting for $container..."
+            for _ in $(seq 1 60); do
+              status="$(docker inspect --format '{{.State.Health.Status}}' "$container" 2>/dev/null || echo starting)"
+              [ "$status" = "healthy" ] && break
+              sleep 2
+            done
+            status="$(docker inspect --format '{{.State.Health.Status}}' "$container")"
+            if [ "$status" != "healthy" ]; then
+              echo "::error::$container never became healthy (status=$status)"
+              docker logs "$container" | tail -50
+              exit 1
+            fi
+            echo "$container is healthy"
+          done
+
+      # Both services run on the runner host, so every endpoint is localhost
+      # here. Inside Docker Compose they address each other by service name.
+      # Run from sidecar/ so `app` is importable as a top-level package, exactly
+      # as it is inside the container. app/stubs.py locates /shared/python on
+      # its own, so no PYTHONPATH is needed.
+      - name: Start the sidecar
+        working-directory: sidecar
+        env:
+          REDIS_URL: redis://localhost:6379/0
+          OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://localhost:4318/v1/traces
+          OTEL_SERVICE_NAME: prediction-sidecar
+          GRPC_PORT: "50051"
+          LOG_LEVEL: INFO
+        run: |
+          python -m app.server > ../sidecar.log 2>&1 &
+          echo $! > ../sidecar.pid
+          for _ in $(seq 1 60); do
+            if python -m app.healthcheck 2>/dev/null; then
+              echo "sidecar is serving"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::sidecar never reported SERVING"
+          tail -50 ../sidecar.log
+          exit 1
+
+      - name: Start the API gateway
+        env:
+          PORT: "3000"
+          SIDECAR_GRPC_TARGET: localhost:50051
+          OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://localhost:4318/v1/traces
+          OTEL_SERVICE_NAME: prediction-api
+          JAEGER_QUERY_URL: http://localhost:16686
+          LOG_LEVEL: info
+        run: |
+          node --import ./api/otel-hook.mjs api/dist/server.js > api.log 2>&1 &
+          echo $! > api.pid
+          for _ in $(seq 1 60); do
+            curl -fsS localhost:3000/healthz >/dev/null 2>&1 && break
+            sleep 2
+          done
+          curl -fsS localhost:3000/healthz
+          echo "gateway is healthy"
+
+      - name: Smoke-test the documented endpoints
+        run: |
+          echo "--- POST /predict ---"
+          curl -fsS localhost:3000/predict -d '{"input":[1,2,3]}' | tee predict.json
+          echo
+          echo "--- GET /trace-test ---"
+          curl -fsS localhost:3000/trace-test | tee trace-test.json
+          echo
+          node -e "
+            const t = require('./trace-test.json');
+            if (!t.verified) { console.error('trace was not verified in Jaeger'); process.exit(1); }
+            if (!t.cross_service) { console.error('trace did not span both services'); process.exit(1); }
+            console.log('verified trace', t.trace_id, 'across', t.services.join(', '));
+          "
+
+      - name: pnpm test
+        run: pnpm test
+
+      - name: Dump service logs on failure
+        if: failure()
+        run: |
+          echo "::group::api.log";     tail -200 api.log     || true; echo "::endgroup::"
+          echo "::group::sidecar.log"; tail -200 sidecar.log || true; echo "::endgroup::"
+          echo "::group::jaeger";      docker logs jaeger 2>&1 | tail -100 || true; echo "::endgroup::"
+          echo "::group::redis";       docker logs redis  2>&1 | tail -100 || true; echo "::endgroup::"
+
+      - name: Tear down
+        if: always()
+        run: |
+          [ -f api.pid ] && kill "$(cat api.pid)" 2>/dev/null || true
+          [ -f sidecar.pid ] && kill "$(cat sidecar.pid)" 2>/dev/null || true
+          docker rm -f redis jaeger 2>/dev/null || true
+
+  # --------------------------------------------------------------- images
+  images:
+    name: Build images and enforce the size budget
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build API image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: api/Dockerfile
+          tags: ${{ env.API_IMAGE }}:ci
+          load: true
+          provenance: false
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,scope=api,mode=max
+
+      - name: Build sidecar image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: sidecar/Dockerfile
+          tags: ${{ env.SIDECAR_IMAGE }}:ci
+          load: true
+          provenance: false
+          cache-from: type=gha,scope=sidecar
+          cache-to: type=gha,scope=sidecar,mode=max
+
+      - name: Enforce the 300 MB budget
+        run: |
+          scripts/check-image-size.sh --max-mb "$MAX_IMAGE_MB" \
+            "${API_IMAGE}:ci" "${SIDECAR_IMAGE}:ci"
+
+      - name: Verify the composed stack starts and answers
+        run: |
+          docker compose up -d --wait --wait-timeout 180
+          curl -fsS localhost:3000/predict -d '{"input":[1,2,3]}'
+          echo
+          curl -fsS localhost:3000/trace-test
+          echo
+          curl -fsS 'localhost:3000/stream?input=1,2,3&steps=3' --max-time 60
+
+      - name: Dump compose logs on failure
+        if: failure()
+        run: docker compose logs --tail 200
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v || true
+
+  # -------------------------------------------------------------- publish
+  publish:
+    name: Push images to GHCR
+    runs-on: ubuntu-latest
+    needs: [test, images]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Authenticates with $GHCR_TOKEN. Set it as a repository secret; the
+      # fallback to the automatic GITHUB_TOKEN keeps forks and fresh clones
+      # working without extra setup (it already carries `packages: write`).
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+        run: |
+          token="${GHCR_TOKEN:-${{ secrets.GITHUB_TOKEN }}}"
+          if [ -z "$token" ]; then
+            echo "::error::neither GHCR_TOKEN nor GITHUB_TOKEN is available"
+            exit 1
+          fi
+          echo "$token" | docker login "$REGISTRY" -u "${{ github.actor }}" --password-stdin
+
+      # docker/build-push-action takes newline-separated, fully-qualified
+      # `image:tag` values, so the tag list is expanded per image here.
+      - name: Derive image tags
+        id: meta
+        run: |
+          sha_tag="sha-$(git rev-parse --short HEAD)"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            suffixes=("${GITHUB_REF#refs/tags/}" "latest" "$sha_tag")
+          else
+            suffixes=("main" "$sha_tag")
+          fi
+
+          {
+            echo "api_tags<<TAGS"
+            for suffix in "${suffixes[@]}"; do echo "${API_IMAGE}:${suffix}"; done
+            echo "TAGS"
+            echo "sidecar_tags<<TAGS"
+            for suffix in "${suffixes[@]}"; do echo "${SIDECAR_IMAGE}:${suffix}"; done
+            echo "TAGS"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "publishing tags: ${suffixes[*]}"
+
+      - name: Push API image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: api/Dockerfile
+          push: true
+          provenance: false
+          tags: ${{ steps.meta.outputs.api_tags }}
+          cache-from: type=gha,scope=api
+
+      - name: Push sidecar image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: sidecar/Dockerfile
+          push: true
+          provenance: false
+          tags: ${{ steps.meta.outputs.sidecar_tags }}
+          cache-from: type=gha,scope=sidecar

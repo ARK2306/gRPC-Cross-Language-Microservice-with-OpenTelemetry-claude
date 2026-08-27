@@ -1,0 +1,6 @@
+# Development/test-only dependencies for the sidecar.
+-r requirements.txt
+
+grpcio-tools==1.83.0
+pytest==8.4.2
+pytest-asyncio==1.3.0

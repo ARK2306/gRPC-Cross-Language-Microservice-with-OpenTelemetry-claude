@@ -1,0 +1,124 @@
+# Local stack: Jaeger + Redis + the two application services.
+#
+#   docker compose up -d --build
+#   curl -X POST localhost:3000/predict -H 'content-type: application/json' -d '{"input":[1,2,3]}'
+#   curl localhost:3000/trace-test
+#   open http://localhost:16686        # Jaeger UI
+#
+# Every OTLP endpoint below uses the Compose service name `jaeger`, not
+# localhost: containers resolve each other by service name on the shared
+# network, and localhost inside a container is that container itself.
+
+name: grpc-prediction
+
+services:
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    container_name: grpc-prediction-jaeger
+    restart: unless-stopped
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+      # Keep the in-memory store bounded so a long-running dev stack cannot
+      # exhaust host memory.
+      MEMORY_MAX_TRACES: "50000"
+      SPAN_STORAGE_TYPE: memory
+    ports:
+      - "16686:16686"   # Jaeger UI + query API
+      - "4318:4318"     # OTLP/HTTP  <- both services export here
+      - "4317:4317"     # OTLP/gRPC
+      - "14250:14250"   # collector, model.proto over gRPC
+    healthcheck:
+      # 14269 is Jaeger's admin port; `/` returns 200 once the collector and
+      # query service are both up. wget is present in the all-in-one image.
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:14269/"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    networks: [prediction]
+
+  redis:
+    image: redis:7-alpine
+    container_name: grpc-prediction-redis
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    networks: [prediction]
+
+  sidecar:
+    build:
+      # Repository root: the build needs /proto as well as /sidecar.
+      context: .
+      dockerfile: sidecar/Dockerfile
+    image: ghcr.io/ark2306/grpc-prediction-sidecar:local
+    container_name: grpc-prediction-sidecar
+    restart: unless-stopped
+    environment:
+      GRPC_HOST: 0.0.0.0
+      GRPC_PORT: "50051"
+      REDIS_URL: redis://redis:6379/0
+      CACHE_TTL_SECONDS: "60"
+      OTEL_SERVICE_NAME: prediction-sidecar
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://jaeger:4318/v1/traces
+      DEPLOYMENT_ENV: local
+      LOG_LEVEL: INFO
+    depends_on:
+      redis:
+        condition: service_healthy
+      jaeger:
+        condition: service_healthy
+    ports:
+      - "50051:50051"
+    networks: [prediction]
+
+  api:
+    build:
+      # Repository root: the build needs /proto, /scripts and /api.
+      context: .
+      dockerfile: api/Dockerfile
+    image: ghcr.io/ark2306/grpc-prediction-api:local
+    container_name: grpc-prediction-api
+    restart: unless-stopped
+    environment:
+      HOST: 0.0.0.0
+      PORT: "3000"
+      SIDECAR_GRPC_TARGET: sidecar:50051
+      OTEL_SERVICE_NAME: prediction-api
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://jaeger:4318/v1/traces
+      JAEGER_QUERY_URL: http://jaeger:16686
+      DEPLOYMENT_ENV: local
+      LOG_LEVEL: info
+    depends_on:
+      # The gateway does not start until both infrastructure dependencies pass
+      # their health checks, and the sidecar is serving.
+      redis:
+        condition: service_healthy
+      jaeger:
+        condition: service_healthy
+      sidecar:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    networks: [prediction]
+
+networks:
+  prediction:
+    driver: bridge

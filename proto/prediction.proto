@@ -1,0 +1,91 @@
+syntax = "proto3";
+
+package prediction.v1;
+
+option go_package = "github.com/ARK2306/grpc-prediction/gen/prediction/v1;predictionv1";
+
+// PredictionService exposes a mock ML inference model over gRPC.
+//
+// The Node.js REST gateway (/api) is the only expected client; the Python
+// sidecar (/sidecar) is the only expected server implementation.
+service PredictionService {
+  // Predict runs a single synchronous inference over `input`.
+  //
+  // Results are cached in Redis keyed by a hash of (model, input) with a
+  // 60 second TTL, so repeated calls with identical payloads return
+  // `cached = true` without re-running the model.
+  rpc Predict(PredictRequest) returns (PredictResponse);
+
+  // StreamPredictions runs the model incrementally and emits one
+  // PredictionDelta per step. The last message on the stream always has
+  // `final = true`.
+  rpc StreamPredictions(StreamRequest) returns (stream PredictionDelta);
+}
+
+message PredictRequest {
+  // Feature vector to run inference over. Must contain at least one element.
+  repeated double input = 1;
+
+  // Optional model identifier. Defaults to "mock-mlp-v1" when empty.
+  string model = 2;
+
+  // Optional caller-supplied correlation id, echoed back on the response.
+  string request_id = 3;
+}
+
+message PredictResponse {
+  // Model output vector.
+  repeated double output = 1;
+
+  // Scalar confidence-like score derived from `output`.
+  double score = 2;
+
+  // Model identifier that actually served the request.
+  string model = 3;
+
+  // True when the response was served from the Redis cache.
+  bool cached = 4;
+
+  // Redis key the result was stored under (useful for debugging).
+  string cache_key = 5;
+
+  // Wall-clock milliseconds spent inside the model. 0 for cache hits.
+  int64 compute_ms = 6;
+
+  // Echo of PredictRequest.request_id.
+  string request_id = 7;
+}
+
+message StreamRequest {
+  // Feature vector to run inference over. Must contain at least one element.
+  repeated double input = 1;
+
+  // Number of deltas to emit. Clamped by the server to [1, 100]. Defaults to 5.
+  uint32 steps = 2;
+
+  // Optional model identifier. Defaults to "mock-mlp-v1" when empty.
+  string model = 3;
+
+  // Optional caller-supplied correlation id, echoed on every delta.
+  string request_id = 4;
+}
+
+message PredictionDelta {
+  // 1-based index of this delta within the stream.
+  uint32 step = 1;
+
+  // Total number of deltas the server intends to emit.
+  uint32 total_steps = 2;
+
+  // Partial model output contributed by this step.
+  double value = 3;
+
+  // Running sum of `value` across all deltas emitted so far.
+  double cumulative = 4;
+
+  // True only on the last message of the stream.
+  bool final = 5;
+
+  // Echo of StreamRequest.request_id.
+  string request_id = 6;
+}

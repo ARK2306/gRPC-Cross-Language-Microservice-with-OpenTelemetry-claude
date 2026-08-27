@@ -1,0 +1,12 @@
+**/node_modules
+**/dist
+**/.venv
+**/__pycache__
+**/*.pyc
+.git
+.github
+.pnpm-store
+tests/src
+*.log
+.DS_Store
+docker-compose.override.yml
