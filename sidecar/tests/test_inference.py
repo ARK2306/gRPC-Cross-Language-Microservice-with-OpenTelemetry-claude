@@ -127,3 +127,34 @@ class TestRunInferenceSteps:
                     [1, 2], model=MODEL, digest=digest_for([1, 2]), steps=0, **FAST
                 )
             )
+
+
+class TestEarlyStop:
+    """A cancelled stream must stop burning CPU, not run to completion."""
+
+    def test_should_stop_halts_the_generator(self):
+        stop_after = 2
+        seen = []
+
+        def should_stop():
+            return len(seen) >= stop_after
+
+        for step, _value in run_inference_steps(
+            [1, 2, 3],
+            model=MODEL,
+            digest=digest_for([1, 2, 3]),
+            steps=10,
+            should_stop=should_stop,
+            **FAST,
+        ):
+            seen.append(step)
+
+        assert seen == [1, 2], f"generator should have stopped after {stop_after} steps"
+
+    def test_no_stop_callback_runs_every_step(self):
+        steps = list(
+            run_inference_steps(
+                [1, 2, 3], model=MODEL, digest=digest_for([1, 2, 3]), steps=6, **FAST
+            )
+        )
+        assert len(steps) == 6

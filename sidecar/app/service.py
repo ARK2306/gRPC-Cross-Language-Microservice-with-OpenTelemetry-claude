@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import AsyncIterator, Sequence
@@ -189,12 +190,26 @@ class PredictionService(prediction_pb2_grpc.PredictionServiceServicer):
         cumulative = 0.0
         emitted = 0
 
-        # The generator is CPU-bound, so it is drained on a worker thread and
-        # its items are handed back over a bounded queue. maxsize=1 means the
-        # producer stalls when the client stops reading, which is what makes
-        # client cancellation actually stop the work.
-        queue: asyncio.Queue[tuple[int, float] | None | Exception] = asyncio.Queue(maxsize=1)
+        # The generator is CPU-bound, so it runs on a worker thread and hands
+        # items back through a queue.
+        #
+        # The queue is unbounded and the producer publishes with
+        # call_soon_threadsafe, so the worker thread never blocks on the event
+        # loop. A bounded queue would give backpressure, but at the cost of
+        # leaking the worker: cancelling a running run_in_executor future does
+        # nothing, so a producer parked on a full queue after the consumer went
+        # away would stay parked forever. Backpressure is not needed here
+        # anyway — each step costs (budget / steps) seconds of CPU and steps is
+        # capped at 100, so the producer cannot outrun the consumer.
+        #
+        # `cancelled` is what actually stops the work: the generator polls it
+        # between steps and returns early.
+        queue: asyncio.Queue[tuple[int, float] | None | Exception] = asyncio.Queue()
         loop = asyncio.get_running_loop()
+        cancelled = threading.Event()
+
+        def publish(item: tuple[int, float] | None | Exception) -> None:
+            loop.call_soon_threadsafe(queue.put_nowait, item)
 
         def produce() -> None:
             try:
@@ -207,15 +222,16 @@ class PredictionService(prediction_pb2_grpc.PredictionServiceServicer):
                     max_seconds=self._config.max_compute_seconds,
                     matrix_dim=self._config.matrix_dim,
                     output_dim=self._config.output_dim,
+                    should_stop=cancelled.is_set,
                 ):
-                    asyncio.run_coroutine_threadsafe(queue.put((step, value)), loop).result()
+                    publish((step, value))
             except Exception as exc:  # noqa: BLE001 - forwarded to the consumer
-                asyncio.run_coroutine_threadsafe(queue.put(exc), loop).result()
+                publish(exc)
             else:
-                asyncio.run_coroutine_threadsafe(queue.put(None), loop).result()
+                publish(None)
 
         async with self._inflight:
-            producer = loop.run_in_executor(self._executor, produce)
+            loop.run_in_executor(self._executor, produce)
             try:
                 while True:
                     item = await queue.get()
@@ -249,7 +265,9 @@ class PredictionService(prediction_pb2_grpc.PredictionServiceServicer):
                 log.exception("stream failed request_id=%s", request.request_id)
                 await context.abort(grpc.StatusCode.INTERNAL, "streaming inference failed")
             finally:
-                producer.cancel()
+                # Signals the worker to stop between steps; it then drains
+                # naturally instead of being abandoned mid-computation.
+                cancelled.set()
 
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         span.set_attributes({"prediction.deltas_emitted": emitted, "prediction.elapsed_ms": elapsed_ms})

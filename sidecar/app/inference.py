@@ -26,7 +26,7 @@ import hashlib
 import json
 import time
 from dataclasses import dataclass
-from typing import Iterator, Sequence
+from typing import Callable, Iterator, Sequence
 
 import numpy as np
 
@@ -164,6 +164,7 @@ def run_inference_steps(
     max_seconds: float,
     matrix_dim: int,
     output_dim: int,
+    should_stop: Callable[[], bool] | None = None,
 ) -> Iterator[tuple[int, float]]:
     """Incremental variant backing the server-streaming RPC.
 
@@ -171,6 +172,10 @@ def run_inference_steps(
     `steps` chunks so the client sees deltas arrive steadily rather than all at
     once at the end. Like `run_inference`, the emitted values are deterministic
     and only the padding is time-driven.
+
+    `should_stop` is polled between steps; when it returns True the generator
+    returns early. The caller passes a flag set on client cancellation, so an
+    abandoned stream stops burning CPU instead of running to completion.
     """
     if steps <= 0:
         raise ValueError("steps must be >= 1")
@@ -182,6 +187,9 @@ def run_inference_steps(
     state = _project(values, matrix_dim)
 
     for step in range(1, steps + 1):
+        if should_stop is not None and should_stop():
+            return
+
         step_deadline = time.perf_counter() + per_step
 
         state = _forward(state, left, right, MODEL_DEPTH)

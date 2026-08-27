@@ -28,8 +28,9 @@ env:
   PYTHON_VERSION: "3.12"
   PNPM_VERSION: "9.15.4"
   REGISTRY: ghcr.io
-  API_IMAGE: ghcr.io/${{ github.repository_owner }}/grpc-prediction-api
-  SIDECAR_IMAGE: ghcr.io/${{ github.repository_owner }}/grpc-prediction-sidecar
+  # API_IMAGE / SIDECAR_IMAGE are set per job by the "Resolve image names" step:
+  # github.repository_owner preserves the account's original casing, and GHCR
+  # rejects any tag whose repository name is not lowercase.
   MAX_IMAGE_MB: "300"
 
 jobs:
@@ -265,6 +266,12 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
+      - name: Resolve image names
+        run: |
+          owner="$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+          echo "API_IMAGE=ghcr.io/${owner}/grpc-prediction-api" >> "$GITHUB_ENV"
+          echo "SIDECAR_IMAGE=ghcr.io/${owner}/grpc-prediction-sidecar" >> "$GITHUB_ENV"
+
       - name: Build API image
         uses: docker/build-push-action@v6
         with:
@@ -322,6 +329,12 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: docker/setup-buildx-action@v3
+
+      - name: Resolve image names
+        run: |
+          owner="$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+          echo "API_IMAGE=ghcr.io/${owner}/grpc-prediction-api" >> "$GITHUB_ENV"
+          echo "SIDECAR_IMAGE=ghcr.io/${owner}/grpc-prediction-sidecar" >> "$GITHUB_ENV"
 
       # Authenticates with $GHCR_TOKEN. Set it as a repository secret; the
       # fallback to the automatic GITHUB_TOKEN keeps forks and fresh clones
