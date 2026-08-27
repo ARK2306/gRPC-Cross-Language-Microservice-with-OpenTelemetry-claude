@@ -402,8 +402,23 @@ sidecar's gRPC health service must report `SERVING` before the gateway does.
    `<version>`/`latest`/`sha-<short>` for tags).
 
 `publish` requires both `test` and `images` to pass, so a broken build can never
-be promoted. Set `GHCR_TOKEN` as a repository secret with `write:packages`; the
-workflow falls back to the automatic `GITHUB_TOKEN` if it is absent.
+be promoted.
+
+### Enabling the GHCR push
+
+Publishing needs a credential with `write:packages`. Until one is configured the
+first three jobs pass and `publish` fails with an explicit hint — it is the only
+step that needs setup outside this repository. Either:
+
+1. **Recommended, and what the workflow is written for.** Create a personal
+   access token with the `write:packages` scope and add it as a repository
+   secret named `GHCR_TOKEN`:
+   *Settings → Secrets and variables → Actions → New repository secret.*
+2. **Or** let the built-in token write packages:
+   *Settings → Actions → General → Workflow permissions → "Read and write
+   permissions".* The workflow falls back to `GITHUB_TOKEN` when `GHCR_TOKEN`
+   is absent, but that fallback is denied while the repository default is
+   read-only.
 
 ---
 

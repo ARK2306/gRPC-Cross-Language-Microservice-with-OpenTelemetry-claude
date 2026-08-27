@@ -336,15 +336,24 @@ jobs:
           echo "API_IMAGE=ghcr.io/${owner}/grpc-prediction-api" >> "$GITHUB_ENV"
           echo "SIDECAR_IMAGE=ghcr.io/${owner}/grpc-prediction-sidecar" >> "$GITHUB_ENV"
 
-      # Authenticates with $GHCR_TOKEN. Set it as a repository secret; the
-      # fallback to the automatic GITHUB_TOKEN keeps forks and fresh clones
-      # working without extra setup (it already carries `packages: write`).
+      # Authenticates with $GHCR_TOKEN, per the deployment requirements. The
+      # fallback to the automatic GITHUB_TOKEN only works when the repository
+      # allows workflows write access; see the failure hint at the end of this
+      # job for the two ways to grant it.
       - name: Log in to GHCR
         env:
           GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          token="${GHCR_TOKEN:-${{ secrets.GITHUB_TOKEN }}}"
-          if [ -z "$token" ]; then
+          if [ -n "$GHCR_TOKEN" ]; then
+            echo "authenticating to $REGISTRY with GHCR_TOKEN"
+            token="$GHCR_TOKEN"
+          elif [ -n "$GITHUB_TOKEN" ]; then
+            echo "::warning::GHCR_TOKEN is not set; falling back to GITHUB_TOKEN. \
+          This only works if Settings -> Actions -> Workflow permissions is set to \
+          'Read and write permissions'."
+            token="$GITHUB_TOKEN"
+          else
             echo "::error::neither GHCR_TOKEN nor GITHUB_TOKEN is available"
             exit 1
           fi
@@ -392,3 +401,27 @@ jobs:
           provenance: false
           tags: ${{ steps.meta.outputs.sidecar_tags }}
           cache-from: type=gha,scope=sidecar
+
+      # `denied: permission_denied: write_package` surfaces deep inside a buildx
+      # log and says nothing about the cause, so translate it here.
+      - name: Explain a push failure
+        if: failure()
+        run: |
+          cat <<'HINT'
+          ::error::Pushing to GHCR was denied.
+
+          Publishing needs a credential with `write:packages`. Either:
+
+            1. (recommended, and what this workflow is written for)
+               Create a PAT with `write:packages` and add it as the repository
+               secret GHCR_TOKEN:
+                 Settings -> Secrets and variables -> Actions -> New repository secret
+
+            2. Or allow the built-in token to write packages:
+                 Settings -> Actions -> General -> Workflow permissions
+                 -> "Read and write permissions"
+
+          Everything else in this pipeline (build, integration tests, image size
+          budget) is independent of this and has already passed.
+          HINT
+          exit 1

@@ -84,9 +84,9 @@ export class GrpcCallError extends Error {
   }
 }
 
-function wrap(err: grpc.ServiceError): GrpcCallError {
+function wrap(err: grpc.ServiceError, rpc: string): GrpcCallError {
   return new GrpcCallError(
-    `sidecar Predict failed: ${grpc.status[err.code] ?? err.code}: ${err.details}`,
+    `sidecar ${rpc} failed: ${grpc.status[err.code] ?? err.code}: ${err.details}`,
     err.code,
     err.details,
   );
@@ -96,7 +96,7 @@ function wrap(err: grpc.ServiceError): GrpcCallError {
 export function predict(request: PredictRequest): Promise<PredictResponse__Output> {
   return new Promise((resolve, reject) => {
     predictionClient.Predict(request, deadline(config.grpcDeadlineMs), (err, response) => {
-      if (err) return reject(wrap(err as grpc.ServiceError));
+      if (err) return reject(wrap(err as grpc.ServiceError, "Predict"));
       if (!response) return reject(new Error("sidecar returned an empty Predict response"));
       resolve(response);
     });
@@ -129,7 +129,7 @@ export async function* streamPredictions(
   } catch (err) {
     // A cancellation we initiated is an expected end-of-stream, not an error.
     if (signal?.aborted && (err as grpc.ServiceError)?.code === grpc.status.CANCELLED) return;
-    throw wrap(err as grpc.ServiceError);
+    throw wrap(err as grpc.ServiceError, "StreamPredictions");
   } finally {
     signal?.removeEventListener("abort", onAbort);
   }
